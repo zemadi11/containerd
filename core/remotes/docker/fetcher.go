@@ -23,11 +23,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strings"
 	"sync"
+	"io"
+	"github.com/containerd/containerd/v2/core/remotes/frisbeecache"
+
 
 	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
@@ -218,8 +220,61 @@ type dockerFetcher struct {
 
 func (r dockerFetcher) Fetch(ctx context.Context, desc ocispec.Descriptor) (io.ReadCloser, error) {
 	ctx = log.WithLogger(ctx, log.G(ctx).WithField("digest", desc.Digest))
+	log.G(ctx).Infof("FRISBEE-CANDIDATE mediaType=%s size=%d urls=%d", desc.MediaType, desc.Size, len(desc.URLs))
 
-	hosts := r.filterHosts(HostCapabilityPull)
+	if rc, ok, err := frisbeecache.TryOpenOrFetch(ctx, desc); ok {
+        	return rc, err
+     	}
+
+    	hosts := r.filterHosts(HostCapabilityPull)
+    	if len(hosts) == 0 {
+        	return nil, fmt.Errorf("no pull hosts: %w", errdefs.ErrNotFound)
+    	}
+	
+	//if images.IsLayerType(desc.MediaType) {
+    	//	parts := strings.SplitN(desc.Digest.String(), ":", 2)
+    		//if len(parts) == 2 {
+        	//	p := filepath.Join("/var/lib/frisbee-blobs", parts[0], parts[1])
+
+        	//	if f, err := os.Open(p); err == nil {
+            	//	   log.G(ctx).Infof("FRISBEE-HIT serving from cache path=%s", p)
+            	  //         return f, nil
+        	//}
+
+        	//log.G(ctx).Infof("FRISBEE-MISS cache path=%s", p)
+
+        	//if os.Getenv("FRISBEE_ENABLE") == "1" {
+           	    //if err := fetchViaFrisbee(ctx, desc.Digest.String(), p); err != nil {
+                      //  return nil, err
+            	    //}
+            	  //  f, err := os.Open(p)
+            	//    if err != nil {
+              //          return nil, err
+            //	    }
+            //	    log.G(ctx).Infof("FRISBEE-HIT-AFTER-FETCH path=%s", p)
+          //  	    return f, nil
+        //	}
+          //    }
+        //    }
+
+	// --- Frisbee cache prototype: serve layer blobs from local disk if present ---
+	//if images.IsLayerType(desc.MediaType) {
+		// desc.Digest.String() looks like "sha256:abcd..."
+		//parts := strings.SplitN(desc.Digest.String(), ":", 2)
+		//if len(parts) == 2 {
+			//p := filepath.Join("/var/lib/frisbee-blobs", parts[0], parts[1])
+			//if f, err := os.Open(p); err == nil {
+				//log.G(ctx).Infof("FRISBEE-HIT serving from cache path=%s", p)
+				//return f, nil
+			//}
+			//log.G(ctx).Infof("FRISBEE-MISS cache path=%s", p)
+		//}
+	//}
+	// --- end Frisbee cache prototype ---
+
+
+
+	hosts = r.filterHosts(HostCapabilityPull)
 	if len(hosts) == 0 {
 		return nil, fmt.Errorf("no pull hosts: %w", errdefs.ErrNotFound)
 	}
