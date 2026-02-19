@@ -1,6 +1,7 @@
 package docker
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -20,6 +21,7 @@ import (
 )
 
 type frisbeeTransfer struct{}
+
 var _ = (frisbeeTransfer{}).FetchBlob
 
 type controlResp struct {
@@ -53,22 +55,24 @@ func (frisbeeTransfer) FetchBlob(ctx context.Context, digestStr, outPath string)
 	frisbeeBin := getenv("FRISBEE_BIN", "/usr/local/bin/frisbee")
 	timeout := getenvDuration("FRISBEE_TIMEOUT", 180*time.Second)
 
-	// frisbee -k expects KB. "0" may be treated as invalid/clamped.
-	// Default 256MB socket buffer (in KB).
-	sockbufKB := getenvInt("FRISBEE_SOCKBUF_KB", 262144)
-	if sockbufKB < 1024 {
+	// MATCH ADVISOR CLIENT FLAGS:
+	// client: frisbee -M 256 -k 1024 -N -i 10.10.1.2 -m 239.192.0.1 -p 6001 /dev/null
+	// NOTE: containerd needs a real output file (blob), so we cannot use /dev/null in normal operation.
+	// We'll still use the exact flags, but write to a temp file -> verify -> rename.
+
+	sockbufKB := getenvInt("FRISBEE_SOCKBUF_KB", 1024)   // -k 1024
+	totalBufMB := getenvInt("FRISBEE_TOTALBUF_MB", 256)  // -M 256
+	useNoDecomp := getenvBool("FRISBEE_NODECOMP", true)  // -N
+	useInOrder := getenvBool("FRISBEE_INORDER", false)   // advisor does NOT use -O
+	benchNull := getenvBool("FRISBEE_BENCH_NULL", false) // if true, use /dev/null and skip verify/rename
+
+	// Hard clamp to keep arguments sane
+	if sockbufKB < 1 {
 		sockbufKB = 1024
 	}
-
-	// frisbee -M is total buffering in MB. Default 4GB.
-	totalBufMB := getenvInt("FRISBEE_TOTALBUF_MB", 4096)
-	if totalBufMB < 64 {
-		totalBufMB = 64
+	if totalBufMB < 1 {
+		totalBufMB = 256
 	}
-
-	// Optional booleans
-	useInOrder := getenvBool("FRISBEE_INORDER", true) // adds -O if true
-	useNoDecomp := getenvBool("FRISBEE_NODECOMP", true) // adds -N if true
 
 	if err := os.MkdirAll(filepath.Dir(outPath), 0755); err != nil {
 		return err
@@ -76,6 +80,12 @@ func (frisbeeTransfer) FetchBlob(ctx context.Context, digestStr, outPath string)
 
 	tmp := fmt.Sprintf("%s.tmp.%d.%d", outPath, time.Now().UnixNano(), rand.Intn(1_000_000))
 	_ = os.Remove(tmp)
+
+	// Choose output path for frisbee:
+	outArg := tmp
+	if benchNull {
+		outArg = "/dev/null"
+	}
 
 	args := []string{}
 	if useNoDecomp {
@@ -85,17 +95,22 @@ func (frisbeeTransfer) FetchBlob(ctx context.Context, digestStr, outPath string)
 		args = append(args, "-O")
 	}
 	args = append(args,
-		"-k", strconv.Itoa(sockbufKB),
 		"-M", strconv.Itoa(totalBufMB),
+		"-k", strconv.Itoa(sockbufKB),
+		"-i", ifIP,
 		"-m", cr.Mcast,
 		"-p", cr.Port,
-		"-i", ifIP,
-		tmp,
+		outArg,
 	)
 
+	// Client log file (stdout/stderr from frisbee binary)
+	clientLogDir := getenv("FRISBEE_CLIENT_LOG_DIR", "/tmp")
+	_ = os.MkdirAll(clientLogDir, 0755)
+	clientLogPath := filepath.Join(clientLogDir, fmt.Sprintf("frisbee_client_%s_p%s.log", hex64, cr.Port))
+
 	log.G(ctx).Infof(
-		"FRISBEE-MCAST-START hex=%s mcast=%s port=%s ifip=%s tmp=%s sockbuf_kb=%d totalbuf_mb=%d inorder=%v nodecomp=%v",
-		hex64, cr.Mcast, cr.Port, ifIP, tmp, sockbufKB, totalBufMB, useInOrder, useNoDecomp,
+		"FRISBEE-MCAST-START hex=%s mcast=%s port=%s ifip=%s out=%s sockbuf_kb=%d totalbuf_mb=%d inorder=%v nodecomp=%v bench_null=%v client_log=%s",
+		hex64, cr.Mcast, cr.Port, ifIP, outArg, sockbufKB, totalBufMB, useInOrder, useNoDecomp, benchNull, clientLogPath,
 	)
 	log.G(ctx).Infof("FRISBEE-CMD: %s %s", frisbeeBin, strings.Join(args, " "))
 
@@ -103,15 +118,38 @@ func (frisbeeTransfer) FetchBlob(ctx context.Context, digestStr, outPath string)
 	defer cancel()
 
 	cmd := exec.CommandContext(cctx, frisbeeBin, args...)
-	out, runErr := cmd.CombinedOutput()
+
+	// Write stdout/stderr to BOTH memory and file
+	var buf bytes.Buffer
+	logf, err := os.OpenFile(clientLogPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		// still run; just won't have a file
+		log.G(ctx).Warnf("FRISBEE: could not open client log %s: %v", clientLogPath, err)
+		cmd.Stdout = &buf
+		cmd.Stderr = &buf
+	} else {
+		defer logf.Close()
+		mw := io.MultiWriter(&buf, logf)
+		cmd.Stdout = mw
+		cmd.Stderr = mw
+	}
+
+	runErr := cmd.Run()
+	out := buf.Bytes()
 
 	if cctx.Err() == context.DeadlineExceeded {
 		_ = os.Remove(tmp)
-		return fmt.Errorf("frisbee: timeout after %s (out=%s)", timeout, string(out))
+		return fmt.Errorf("frisbee: timeout after %s (client_log=%s)", timeout, clientLogPath)
 	}
 	if runErr != nil {
 		_ = os.Remove(tmp)
-		return fmt.Errorf("frisbee: client failed: %v (out=%s)", runErr, string(out))
+		return fmt.Errorf("frisbee: client failed: %v (client_log=%s out=%s)", runErr, clientLogPath, string(out))
+	}
+
+	// Bench mode: mimic /dev/null behavior; containerd integration should NOT use this.
+	if benchNull {
+		log.G(ctx).Infof("FRISBEE-MCAST-OK (bench null) hex=%s", hex64)
+		return nil
 	}
 
 	if err := verifySHA256(tmp, hex64); err != nil {
@@ -124,7 +162,7 @@ func (frisbeeTransfer) FetchBlob(ctx context.Context, digestStr, outPath string)
 		return err
 	}
 
-	log.G(ctx).Infof("FRISBEE-MCAST-OK hex=%s out=%s", hex64, outPath)
+	log.G(ctx).Infof("FRISBEE-MCAST-OK hex=%s out=%s client_log=%s", hex64, outPath, clientLogPath)
 	return nil
 }
 
