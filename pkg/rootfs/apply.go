@@ -21,6 +21,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/containerd/containerd/v2/core/diff"
@@ -99,7 +100,7 @@ func ApplyLayerWithOpts(ctx context.Context, layer Layer, chain []digest.Digest,
 		}
 
 		if err := applyLayers(ctx, []Layer{layer}, append(chain, layer.Diff.Digest), sn, a, opts, applyOpts); err != nil {
-			if !errdefs.IsAlreadyExists(err) {
+			if !isPrepareSatisfied(err) {
 				return false, err
 			}
 		} else {
@@ -108,6 +109,16 @@ func ApplyLayerWithOpts(ctx context.Context, layer Layer, chain []digest.Digest,
 	}
 	return applied, nil
 
+}
+
+func isPrepareSatisfied(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errdefs.IsAlreadyExists(err) {
+		return true
+	}
+	return strings.Contains(err.Error(), "extraction snapshot already satisfied by committed chain")
 }
 
 func applyLayers(ctx context.Context, layers []Layer, chain []digest.Digest, sn snapshots.Snapshotter, a diff.Applier, opts []snapshots.Opt, applyOpts []diff.ApplyOpt) error {
@@ -129,16 +140,24 @@ func applyLayers(ctx context.Context, layers []Layer, chain []digest.Digest, sn 
 		if err != nil {
 			if errdefs.IsNotFound(err) && len(layers) > 1 {
 				if err := applyLayers(ctx, layers[:len(layers)-1], chain[:len(chain)-1], sn, a, opts, applyOpts); err != nil {
-					if !errdefs.IsAlreadyExists(err) {
+					if !isPrepareSatisfied(err) {
 						return err
 					}
 				}
 				// Do no try applying layers again
 				layers = nil
 				continue
-			} else if errdefs.IsAlreadyExists(err) {
-				// Try a different key
-				continue
+			} else if isPrepareSatisfied(err) {
+				// Snapshotter says chain content is already satisfied.
+				// Register chain metadata by creating+committing an active snapshot.
+				regKey := fmt.Sprintf("ndz-register-%s-%s", uniquePart(), chainID.String())
+				if _, perr := sn.Prepare(ctx, regKey, parent.String(), opts...); perr == nil {
+					if cerr := sn.Commit(ctx, chainID.String(), regKey, opts...); cerr == nil || errdefs.IsAlreadyExists(cerr) {
+						return nil
+					}
+					_ = sn.Remove(ctx, regKey)
+				}
+				return fmt.Errorf("failed to register satisfied chain %s", chainID.String())
 			}
 
 			// Already exists should have the caller retry
@@ -149,7 +168,7 @@ func applyLayers(ctx context.Context, layers []Layer, chain []digest.Digest, sn 
 	}
 	defer func() {
 		if err != nil {
-			if !errdefs.IsAlreadyExists(err) {
+			if !isPrepareSatisfied(err) {
 				log.G(ctx).WithError(err).WithField("key", key).Infof("apply failure, attempting cleanup")
 			}
 
