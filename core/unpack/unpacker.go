@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -409,7 +410,7 @@ func (u *Unpacker) unpack(
 			key = fmt.Sprintf(snapshots.UnpackKeyFormat, uniquePart(), chainID)
 			mounts, err = sn.Prepare(ctx, key, parent, opts...)
 			if err != nil {
-				if errdefs.IsAlreadyExists(err) {
+				if isPrepareSatisfied(err) {
 					if snInfo, err := sn.Stat(ctx, chainID); err != nil {
 						if !errdefs.IsNotFound(err) {
 							return nil, fmt.Errorf("failed to stat snapshot %s: %w", chainID, err)
@@ -488,7 +489,7 @@ func (u *Unpacker) unpack(
 					}
 					if err = sn.Commit(ctx, chainID, key, opts...); err != nil {
 						cleanup.Do(ctx, abort)
-						if errdefs.IsAlreadyExists(err) {
+						if isPrepareSatisfied(err) {
 							return nil
 						}
 						return fmt.Errorf("failed to commit snapshot %s: %w", key, err)
@@ -739,6 +740,17 @@ func (u *Unpacker) supportParallel(unpack *Platform) bool {
 		return false
 	}
 	return true
+}
+
+func isPrepareSatisfied(err error) bool {
+	if err == nil {
+		return false
+	}
+	if isPrepareSatisfied(err) {
+		return true
+	}
+	// proxy snapshotter may return this as "unknown", so match message too
+	return strings.Contains(err.Error(), "extraction snapshot already satisfied by committed chain")
 }
 
 func uniquePart() string {

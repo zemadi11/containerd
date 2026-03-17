@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/containerd/containerd/v2/core/content"
@@ -346,7 +347,11 @@ func (i *image) Unpack(ctx context.Context, snapshotterName string, opts ...Unpa
 	for _, layer := range layers {
 		unpacked, err = rootfs.ApplyLayerWithOpts(ctx, layer, chain, sn, a, config.SnapshotOpts, config.ApplyOpts)
 		if err != nil {
-			return fmt.Errorf("apply layer error for %q: %w", i.Name(), err)
+			if strings.Contains(err.Error(), "extraction snapshot already satisfied by committed chain") {
+				unpacked = false
+			} else {
+				return fmt.Errorf("apply layer error for %q: %w", i.Name(), err)
+			}
 		}
 
 		if unpacked {
