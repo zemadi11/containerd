@@ -23,10 +23,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/containerd/containerd/v2/core/remotes/frisbeecache"
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -221,20 +222,28 @@ func (r dockerFetcher) Fetch(ctx context.Context, desc ocispec.Descriptor) (io.R
 	ctx = log.WithLogger(ctx, log.G(ctx).WithField("digest", desc.Digest))
 	log.G(ctx).Infof("FRISBEE-CANDIDATE mediaType=%s size=%d urls=%d", desc.MediaType, desc.Size, len(desc.URLs))
 
-	 rc, ok, frisbeeErr := frisbeecache.TryOpenOrFetch(ctx, desc)
-		log.G(ctx).Infof("FRISBEE-TRYOPEN ok=%v err=%v mediaType=%s digest=%s size=%d",
-			ok, frisbeeErr, desc.MediaType, desc.Digest.String(), desc.Size)
+	if images.IsLayerType(desc.MediaType) {
+		parts := strings.SplitN(desc.Digest.String(), ":", 2)
+		if len(parts) == 2 {
+			cachePath := filepath.Join("/var/lib/frisbee-blobs", parts[0], parts[1])
 
-		if ok && frisbeeErr == nil {
-		    return rc, nil
-		}
-		if ok && frisbeeErr != nil {
-			if rc != nil {
-				_ = rc.Close()
+			if f, err := os.Open(cachePath); err == nil {
+				log.G(ctx).Infof("FRISBEE-HIT path=%s", cachePath)
+				return f, nil
 			}
-		    log.G(ctx).WithError(frisbeeErr).Infof("FRISBEE-FAILED-FALLBACK digest=%s", desc.Digest)
-	        }
-	
+
+			log.G(ctx).Infof("FRISBEE-MISS path=%s", cachePath)
+
+			if os.Getenv("FRISBEE_ENABLE") == "1" {
+				if err := fetchViaFrisbee(ctx, desc.Digest.String(), cachePath); err != nil {
+					log.G(ctx).WithError(err).Infof("FRISBEE-FAILED-FALLBACK digest=%s", desc.Digest)
+				} else if f, err := os.Open(cachePath); err == nil {
+					log.G(ctx).Infof("FRISBEE-HIT-AFTER-FETCH path=%s", cachePath)
+					return f, nil
+				}
+			}
+		}
+	}
 
 	hosts := r.filterHosts(HostCapabilityPull)
 	if len(hosts) == 0 {
