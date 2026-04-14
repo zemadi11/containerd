@@ -18,6 +18,7 @@ package images
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -40,6 +41,16 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/urfave/cli/v2"
 )
+
+type ctrPullTiming struct {
+	Ref         string `json:"ref"`
+	Snapshotter string `json:"snapshotter"`
+	PullTotalMs int64  `json:"ctr.pull.total_ms"`
+	FetchMs     int64  `json:"ctr.pull.fetch_ms"`
+	UnpackMs    int64  `json:"ctr.pull.unpack_ms"`
+	ChainIDMs   int64  `json:"ctr.pull.chainid_ms"`
+	OtherMs     int64  `json:"ctr.pull.other_ms"`
+}
 
 var pullCommand = &cli.Command{
 	Name:      "pull",
@@ -189,13 +200,21 @@ command. As part of this process, we do the following:
 		}
 		defer done(ctx)
 
+		timing := &ctrPullTiming{
+			Ref:         ref,
+			Snapshotter: cliContext.String("snapshotter"),
+		}
+		pullStart := time.Now()
+
 		// TODO: Handle this locally via transfer config
 		config, err := content.NewFetchConfig(ctx, cliContext)
 		if err != nil {
 			return err
 		}
 
+		fetchStart := time.Now()
 		img, err := content.Fetch(ctx, client, ref, config)
+		timing.FetchMs = time.Since(fetchStart).Milliseconds()
 		if err != nil {
 			return err
 		}
@@ -221,6 +240,7 @@ command. As part of this process, we do the following:
 		}
 
 		start := time.Now()
+		unpackStart := time.Now()
 		for _, platform := range p {
 			fmt.Printf("unpacking %s %s...\n", platforms.Format(platform), img.Target.Digest)
 			i := containerd.NewImageWithPlatform(client, img, platforms.Only(platform))
@@ -229,7 +249,9 @@ command. As part of this process, we do the following:
 				return err
 			}
 			if cliContext.Bool("print-chainid") {
+				chainIDStart := time.Now()
 				diffIDs, err := i.RootFS(ctx)
+				timing.ChainIDMs += time.Since(chainIDStart).Milliseconds()
 				if err != nil {
 					return err
 				}
@@ -237,7 +259,17 @@ command. As part of this process, we do the following:
 				fmt.Printf("image chain ID: %s\n", chainID)
 			}
 		}
+		timing.UnpackMs = time.Since(unpackStart).Milliseconds()
 		fmt.Printf("done: %s\t\n", time.Since(start))
+
+		timing.PullTotalMs = time.Since(pullStart).Milliseconds()
+		timing.OtherMs = timing.PullTotalMs - timing.FetchMs - timing.UnpackMs - timing.ChainIDMs
+		if timing.OtherMs < 0 {
+			timing.OtherMs = 0
+		}
+		if b, err := json.Marshal(timing); err == nil {
+			fmt.Printf("CTR-TIMING %s\n", string(b))
+		}
 		return nil
 	},
 }

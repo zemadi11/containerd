@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/diff"
@@ -298,7 +299,26 @@ func WithUnpackLimiter(limiter *semaphore.Weighted) UnpackOpt {
 	}
 }
 
+type ctrUnpackTiming struct {
+	ImageRef           string `json:"image_ref"`
+	Snapshotter        string `json:"snapshotter"`
+	UnpackTotalMs      int64  `json:"ctr.unpack.total_ms"`
+	ManifestMs         int64  `json:"ctr.unpack.manifest_ms"`
+	LayersMs           int64  `json:"ctr.unpack.layers_ms"`
+	SnapshotterSetupMs int64  `json:"ctr.unpack.snapshotter_setup_ms"`
+	ApplyLayersMs      int64  `json:"ctr.unpack.apply_layers_ms"`
+	ContentLabelMs     int64  `json:"ctr.unpack.content_label_ms"`
+	GCSnapshotLabelMs  int64  `json:"ctr.unpack.gc_snapshot_label_ms"`
+	OtherMs            int64  `json:"ctr.unpack.other_ms"`
+	LayerCount         int    `json:"ctr.unpack.layer_count"`
+}
+
 func (i *image) Unpack(ctx context.Context, snapshotterName string, opts ...UnpackOpt) error {
+	timing := &ctrUnpackTiming{
+		ImageRef: i.Name(),
+	}
+	unpackStart := time.Now()
+
 	ctx, done, err := i.client.WithLease(ctx)
 	if err != nil {
 		return err
@@ -312,15 +332,20 @@ func (i *image) Unpack(ctx context.Context, snapshotterName string, opts ...Unpa
 		}
 	}
 
+	tManifest := time.Now()
 	manifest, err := i.getManifest(ctx, i.platform)
+	timing.ManifestMs = time.Since(tManifest).Milliseconds()
 	if err != nil {
 		return err
 	}
 
+	tLayers := time.Now()
 	layers, err := i.getLayers(ctx, manifest)
+	timing.LayersMs = time.Since(tLayers).Milliseconds()
 	if err != nil {
 		return err
 	}
+	timing.LayerCount = len(layers)
 
 	var (
 		a  = i.client.DiffService()
@@ -329,10 +354,12 @@ func (i *image) Unpack(ctx context.Context, snapshotterName string, opts ...Unpa
 		chain    []digest.Digest
 		unpacked bool
 	)
+	tSnapshotter := time.Now()
 	snapshotterName, err = i.client.resolveSnapshotterName(ctx, snapshotterName)
 	if err != nil {
 		return err
 	}
+	timing.Snapshotter = snapshotterName
 	sn, err := i.client.getSnapshotter(ctx, snapshotterName)
 	if err != nil {
 		return err
@@ -342,9 +369,12 @@ func (i *image) Unpack(ctx context.Context, snapshotterName string, opts ...Unpa
 			return err
 		}
 	}
+	timing.SnapshotterSetupMs = time.Since(tSnapshotter).Milliseconds()
 
 	for _, layer := range layers {
+		tApply := time.Now()
 		unpacked, err = rootfs.ApplyLayerWithOpts(ctx, layer, chain, sn, a, config.SnapshotOpts, config.ApplyOpts)
+		timing.ApplyLayersMs += time.Since(tApply).Milliseconds()
 		if err != nil {
 			return fmt.Errorf("apply layer error for %q: %w", i.Name(), err)
 		}
@@ -358,9 +388,11 @@ func (i *image) Unpack(ctx context.Context, snapshotterName string, opts ...Unpa
 					labels.LabelUncompressed: layer.Diff.Digest.String(),
 				},
 			}
+			tLabel := time.Now()
 			if _, err := cs.Update(ctx, cinfo, "labels."+labels.LabelUncompressed); err != nil {
 				return err
 			}
+			timing.ContentLabelMs += time.Since(tLabel).Milliseconds()
 		}
 
 		chain = append(chain, layer.Diff.Digest)
@@ -380,7 +412,19 @@ func (i *image) Unpack(ctx context.Context, snapshotterName string, opts ...Unpa
 		},
 	}
 
+	tGCLabel := time.Now()
 	_, err = cs.Update(ctx, cinfo, fmt.Sprintf("labels.containerd.io/gc.ref.snapshot.%s", snapshotterName))
+	timing.GCSnapshotLabelMs = time.Since(tGCLabel).Milliseconds()
+
+	timing.UnpackTotalMs = time.Since(unpackStart).Milliseconds()
+	known := timing.ManifestMs + timing.LayersMs + timing.SnapshotterSetupMs + timing.ApplyLayersMs + timing.ContentLabelMs + timing.GCSnapshotLabelMs
+	timing.OtherMs = timing.UnpackTotalMs - known
+	if timing.OtherMs < 0 {
+		timing.OtherMs = 0
+	}
+	if b, mErr := json.Marshal(timing); mErr == nil {
+		fmt.Printf("CTR-UNPACK-TIMING %s\n", string(b))
+	}
 	return err
 }
 

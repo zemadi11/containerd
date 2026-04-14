@@ -178,7 +178,10 @@ func applyLayers(ctx context.Context, layers []Layer, chain []digest.Digest, sn 
 		}
 	}()
 
+	fmt.Printf("A.APPLY begin blob=%s diff=%s chain=%s key=%s\n", layer.Blob.Digest, layer.Diff.Digest, chainID, key)
+	tApplyCall := time.Now()
 	diff, err = a.Apply(ctx, layer.Blob, mounts, applyOpts...)
+	fmt.Printf("A.APPLY done ms=%d blob=%s diff=%s err=%v\n", time.Since(tApplyCall).Milliseconds(), layer.Blob.Digest, layer.Diff.Digest, err)
 	if err != nil {
 		err = fmt.Errorf("failed to extract layer %s: %w", layer.Diff.Digest, err)
 		return err
