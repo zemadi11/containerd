@@ -23,20 +23,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"slices"
-	"strconv"
-	"sync"
-	"sync/atomic"
-	"time"
-
-	"github.com/containerd/errdefs"
-	"github.com/containerd/log"
-	"github.com/containerd/platforms"
-	"github.com/opencontainers/go-digest"
-	"github.com/opencontainers/image-spec/identity"
-	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-	"golang.org/x/sync/errgroup"
-
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/diff"
 	"github.com/containerd/containerd/v2/core/images"
@@ -46,12 +32,31 @@ import (
 	"github.com/containerd/containerd/v2/internal/kmutex"
 	"github.com/containerd/containerd/v2/pkg/labels"
 	"github.com/containerd/containerd/v2/pkg/tracing"
+	"github.com/containerd/errdefs"
+	"github.com/containerd/log"
+	"github.com/containerd/platforms"
+	"github.com/opencontainers/go-digest"
+	"github.com/opencontainers/image-spec/identity"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"golang.org/x/sync/errgroup"
+	"os"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 )
 
 const (
 	labelSnapshotRef = "containerd.io/snapshot.ref"
 	unpackSpanPrefix = "pkg.unpack.unpacker"
 )
+
+func ndzBloblessEnabled(snapshotterKey string) bool {
+	return os.Getenv("NDZ_METADATA_ONLY") == "1" &&
+		strings.Contains(strings.ToLower(snapshotterKey), "ndzproxy")
+}
 
 // Result returns information about the unpacks which were completed.
 type Result struct {
@@ -517,20 +522,29 @@ func (u *Unpacker) unpack(
 				return
 			case err := <-fetchErr[i-fetchOffset]:
 				if err != nil {
-					cleanup.Do(ctx, abort)
-					status.err = err
-					resCh <- status
-					return
+					if ndzBloblessEnabled(unpack.SnapshotterKey) && errdefs.IsNotFound(err) {
+						log.G(ctx).WithError(err).Infof("NDZ-METADATA-ONLY-UNPACK-SKIP-FETCH snapshotter=%s layer=%s", unpack.SnapshotterKey, desc.Digest)
+					} else {
+						cleanup.Do(ctx, abort)
+						status.err = err
+						resCh <- status
+						return
+					}
 				}
 			case <-fetchC[i-fetchOffset]:
 			}
 
 			diff, err := a.Apply(ctx, desc, mounts, unpack.ApplyOpts...)
 			if err != nil {
-				cleanup.Do(ctx, abort)
-				status.err = fmt.Errorf("failed to extract layer (%s %s) to %s as %q: %w", desc.MediaType, desc.Digest, unpack.SnapshotterKey, key, err)
-				resCh <- status
-				return
+				if ndzBloblessEnabled(unpack.SnapshotterKey) && errdefs.IsNotFound(err) {
+					log.G(ctx).WithError(err).Infof("NDZ-METADATA-ONLY-UNPACK-SKIP-APPLY snapshotter=%s layer=%s", unpack.SnapshotterKey, desc.Digest)
+					diff = ocispec.Descriptor{Digest: diffIDs[i]}
+				} else {
+					cleanup.Do(ctx, abort)
+					status.err = fmt.Errorf("failed to extract layer (%s %s) to %s as %q: %w", desc.MediaType, desc.Digest, unpack.SnapshotterKey, key, err)
+					resCh <- status
+					return
+				}
 			}
 
 			if diff.Digest != diffIDs[i] {

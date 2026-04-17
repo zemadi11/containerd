@@ -21,6 +21,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -33,6 +35,7 @@ import (
 	"github.com/containerd/containerd/v2/pkg/labels"
 	"github.com/containerd/containerd/v2/pkg/rootfs"
 	"github.com/containerd/errdefs"
+	"github.com/containerd/log"
 	"github.com/containerd/platforms"
 	"github.com/opencontainers/go-digest"
 	"github.com/opencontainers/image-spec/identity"
@@ -313,6 +316,11 @@ type ctrUnpackTiming struct {
 	LayerCount         int    `json:"ctr.unpack.layer_count"`
 }
 
+func ndzBloblessUnpackEnabled(snapshotterName string) bool {
+	return os.Getenv("NDZ_METADATA_ONLY") == "1" &&
+		strings.Contains(strings.ToLower(snapshotterName), "ndzproxy")
+}
+
 func (i *image) Unpack(ctx context.Context, snapshotterName string, opts ...UnpackOpt) error {
 	timing := &ctrUnpackTiming{
 		ImageRef: i.Name(),
@@ -376,7 +384,11 @@ func (i *image) Unpack(ctx context.Context, snapshotterName string, opts ...Unpa
 		unpacked, err = rootfs.ApplyLayerWithOpts(ctx, layer, chain, sn, a, config.SnapshotOpts, config.ApplyOpts)
 		timing.ApplyLayersMs += time.Since(tApply).Milliseconds()
 		if err != nil {
-			return fmt.Errorf("apply layer error for %q: %w", i.Name(), err)
+			if ndzBloblessUnpackEnabled(snapshotterName) && errdefs.IsNotFound(err) {
+				log.G(ctx).WithError(err).Infof("NDZ-METADATA-ONLY-SKIP-LOCAL-UNPACK snapshotter=%s image=%s layer=%s", snapshotterName, i.Name(), layer.Blob.Digest)
+			} else {
+				return fmt.Errorf("apply layer error for %q: %w", i.Name(), err)
+			}
 		}
 
 		if unpacked {
@@ -390,7 +402,11 @@ func (i *image) Unpack(ctx context.Context, snapshotterName string, opts ...Unpa
 			}
 			tLabel := time.Now()
 			if _, err := cs.Update(ctx, cinfo, "labels."+labels.LabelUncompressed); err != nil {
-				return err
+				if ndzBloblessUnpackEnabled(snapshotterName) && errdefs.IsNotFound(err) {
+					log.G(ctx).WithError(err).Infof("NDZ-METADATA-ONLY-SKIP-CONTENT-LABEL snapshotter=%s image=%s layer=%s", snapshotterName, i.Name(), layer.Blob.Digest)
+				} else {
+					return err
+				}
 			}
 			timing.ContentLabelMs += time.Since(tLabel).Milliseconds()
 		}

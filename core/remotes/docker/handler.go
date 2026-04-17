@@ -19,7 +19,9 @@ package docker
 import (
 	"context"
 	"fmt"
+	"github.com/containerd/errdefs"
 	"net/url"
+	"os"
 	"strings"
 
 	"github.com/containerd/containerd/v2/core/content"
@@ -46,6 +48,10 @@ func AppendDistributionSourceLabel(manager content.Manager, ref string) (images.
 	return func(ctx context.Context, desc ocispec.Descriptor) ([]ocispec.Descriptor, error) {
 		info, err := manager.Info(ctx, desc.Digest)
 		if err != nil {
+			if errdefs.IsNotFound(err) && os.Getenv("NDZ_METADATA_ONLY") == "1" && images.IsLayerType(desc.MediaType) {
+				log.G(ctx).WithError(err).Infof("NDZ-METADATA-ONLY-SKIP-DIST-LABEL digest=%s mediaType=%s", desc.Digest, desc.MediaType)
+				return nil, nil
+			}
 			return nil, err
 		}
 
