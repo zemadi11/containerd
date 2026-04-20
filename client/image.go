@@ -385,7 +385,12 @@ func (i *image) Unpack(ctx context.Context, snapshotterName string, opts ...Unpa
 		timing.ApplyLayersMs += time.Since(tApply).Milliseconds()
 		if err != nil {
 			if ndzBloblessUnpackEnabled(snapshotterName) && errdefs.IsNotFound(err) {
-				log.G(ctx).WithError(err).Infof("NDZ-METADATA-ONLY-SKIP-LOCAL-UNPACK snapshotter=%s image=%s layer=%s", snapshotterName, i.Name(), layer.Blob.Digest)
+				nextChain := append(append([]digest.Digest(nil), chain...), layer.Diff.Digest)
+				chainID := identity.ChainID(nextChain).String()
+				if _, statErr := sn.Stat(ctx, chainID); statErr != nil {
+					return fmt.Errorf("ndz metadata-only apply notfound but snapshot chain %s is missing for image %q layer %s: %w", chainID, i.Name(), layer.Blob.Digest, statErr)
+				}
+				log.G(ctx).WithError(err).Infof("NDZ-METADATA-ONLY-SKIP-LOCAL-UNPACK snapshotter=%s image=%s layer=%s chainID=%s", snapshotterName, i.Name(), layer.Blob.Digest, chainID)
 			} else {
 				return fmt.Errorf("apply layer error for %q: %w", i.Name(), err)
 			}

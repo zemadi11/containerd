@@ -537,7 +537,13 @@ func (u *Unpacker) unpack(
 			diff, err := a.Apply(ctx, desc, mounts, unpack.ApplyOpts...)
 			if err != nil {
 				if ndzBloblessEnabled(unpack.SnapshotterKey) && errdefs.IsNotFound(err) {
-					log.G(ctx).WithError(err).Infof("NDZ-METADATA-ONLY-UNPACK-SKIP-APPLY snapshotter=%s layer=%s", unpack.SnapshotterKey, desc.Digest)
+					if _, statErr := sn.Stat(ctx, chainID); statErr != nil {
+						cleanup.Do(ctx, abort)
+						status.err = fmt.Errorf("ndz metadata-only apply notfound and snapshot chain %s is missing for layer %s: %w", chainID, desc.Digest, statErr)
+						resCh <- status
+						return
+					}
+					log.G(ctx).WithError(err).Infof("NDZ-METADATA-ONLY-UNPACK-SKIP-APPLY snapshotter=%s layer=%s chainID=%s", unpack.SnapshotterKey, desc.Digest, chainID)
 					diff = ocispec.Descriptor{Digest: diffIDs[i]}
 				} else {
 					cleanup.Do(ctx, abort)
