@@ -380,23 +380,13 @@ func (i *image) Unpack(ctx context.Context, snapshotterName string, opts ...Unpa
 	timing.SnapshotterSetupMs = time.Since(tSnapshotter).Milliseconds()
 
 	for _, layer := range layers {
-		nextChain := append(append([]digest.Digest(nil), chain...), layer.Diff.Digest)
-		chainID := identity.ChainID(nextChain).String()
-
-		if ndzBloblessUnpackEnabled(snapshotterName) {
-			if _, statErr := sn.Stat(ctx, chainID); statErr == nil {
-				log.G(ctx).Infof("NDZ-METADATA-ONLY-SKIP-LOCAL-UNPACK snapshotter=%s image=%s layer=%s chainID=%s reason=chain_exists", snapshotterName, i.Name(), layer.Blob.Digest, chainID)
-				chain = nextChain
-				continue
-			} else if !errdefs.IsNotFound(statErr) {
-				return fmt.Errorf("ndz metadata-only unable to stat snapshot chain %s for image %q layer %s: %w", chainID, i.Name(), layer.Blob.Digest, statErr)
-			}
-		}
 		tApply := time.Now()
 		unpacked, err = rootfs.ApplyLayerWithOpts(ctx, layer, chain, sn, a, config.SnapshotOpts, config.ApplyOpts)
 		timing.ApplyLayersMs += time.Since(tApply).Milliseconds()
 		if err != nil {
 			if ndzBloblessUnpackEnabled(snapshotterName) && errdefs.IsNotFound(err) {
+				nextChain := append(append([]digest.Digest(nil), chain...), layer.Diff.Digest)
+				chainID := identity.ChainID(nextChain).String()
 				if _, statErr := sn.Stat(ctx, chainID); statErr != nil {
 					return fmt.Errorf("ndz metadata-only apply notfound but snapshot chain %s is missing for image %q layer %s: %w", chainID, i.Name(), layer.Blob.Digest, statErr)
 				}
@@ -426,7 +416,7 @@ func (i *image) Unpack(ctx context.Context, snapshotterName string, opts ...Unpa
 			timing.ContentLabelMs += time.Since(tLabel).Milliseconds()
 		}
 
-		chain = nextChain
+		chain = append(chain, layer.Diff.Digest)
 	}
 
 	desc, err := i.i.Config(ctx, cs, i.platform)
