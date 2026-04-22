@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"os"
 	"strings"
 	"sync"
 
@@ -115,6 +116,17 @@ func FetchHandler(ingester content.Ingester, fetcher Fetcher) images.HandlerFunc
 // Fetch fetches the given digest into the provided ingester
 func Fetch(ctx context.Context, ingester content.Ingester, fetcher Fetcher, desc ocispec.Descriptor) error {
 	log.G(ctx).Debug("fetch")
+
+	// NDZ blobless mode fetches metadata only and deliberately leaves layer blobs
+	// absent from the content store so unpack can drive snapshotter Prepare and
+	// short-circuit against committed NDZ chains.
+	if os.Getenv("NDZ_METADATA_ONLY") == "1" && images.IsLayerType(desc.MediaType) {
+		log.G(ctx).Infof(
+			"NDZ-METADATA-ONLY-SKIP digest=%s mediaType=%s size=%d",
+			desc.Digest, desc.MediaType, desc.Size,
+		)
+		return nil
+	}
 
 	cw, err := content.OpenWriter(ctx, ingester, content.WithRef(MakeRefKey(ctx, desc)), content.WithDescriptor(desc))
 	if err != nil {
