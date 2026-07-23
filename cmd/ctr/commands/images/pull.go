@@ -97,6 +97,10 @@ command. As part of this process, we do the following:
 			Usage: "Fetch content from local client rather than using transfer service",
 		},
 		&cli.BoolFlag{
+			Name:  "ndz-metadata-only",
+			Usage: "Fetch only OCI manifest/config metadata and obtain layer payloads through ndzproxy (requires --local)",
+		},
+		&cli.BoolFlag{
 			Name:  "sync-fs",
 			Usage: "Synchronize the underlying filesystem containing files when unpack images, false by default",
 		},
@@ -107,6 +111,34 @@ command. As part of this process, we do the following:
 		)
 		if ref == "" {
 			return errors.New("please provide an image reference to pull")
+		}
+
+		if cliContext.Bool("ndz-metadata-only") {
+			if !cliContext.Bool("local") {
+				return errors.New("\"--ndz-metadata-only\" requires \"--local\"")
+			}
+
+			snapshotter := cliContext.String("snapshotter")
+			if !strings.Contains(strings.ToLower(snapshotter), "ndzproxy") {
+				return fmt.Errorf(
+					"\"--ndz-metadata-only\" requires an ndzproxy snapshotter, got %q",
+					snapshotter,
+				)
+			}
+
+			previousValue, hadPreviousValue := os.LookupEnv("NDZ_METADATA_ONLY")
+			if err := os.Setenv("NDZ_METADATA_ONLY", "1"); err != nil {
+				return fmt.Errorf("enable NDZ metadata-only mode: %w", err)
+			}
+			defer func() {
+				if hadPreviousValue {
+					_ = os.Setenv("NDZ_METADATA_ONLY", previousValue)
+				} else {
+					_ = os.Unsetenv("NDZ_METADATA_ONLY")
+				}
+			}()
+
+			fmt.Printf("NDZ-METADATA-ONLY enabled snapshotter=%s\n", snapshotter)
 		}
 
 		client, ctx, cancel, err := commands.NewClient(cliContext)
